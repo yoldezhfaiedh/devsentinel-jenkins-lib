@@ -56,14 +56,38 @@ def buildEnd(Map params) {
 }
 
 // ─── helpers privés ─────────────────────────────────────────────────
+// v2 : --data-binary @file (plus d'échappement shell fragile)
+//      + http_code visible dans la console Jenkins
+//      + response body affichée si erreur
 private def _post(String url, Map body) {
+    def json = groovy.json.JsonOutput.toJson(body)
+    def ts   = System.currentTimeMillis()
+    def payloadFile = "ds_payload_${ts}.json"
+    def respFile    = "ds_resp_${ts}.txt"
     try {
-        def json = groovy.json.JsonOutput.toJson(body)
-        sh(script: """curl -sS -m 5 -X POST -H 'Content-Type: application/json' \
-                      -d '${json.replace("'", "'\\''")}' ${url} || true""",
-           returnStdout: false)
+        writeFile file: payloadFile, text: json
+        def rc = sh(
+            script: """curl -sS -m 10 \
+                       -o ${respFile} \
+                       -w '%{http_code}' \
+                       -X POST \
+                       -H 'Content-Type: application/json' \
+                       --data-binary @${payloadFile} \
+                       ${url}""",
+            returnStdout: true
+        ).trim()
+        echo "[DevSentinel] POST ${url} → HTTP ${rc}"
+        if (!rc.startsWith('2')) {
+            def resp = sh(
+                script: "cat ${respFile} 2>/dev/null | head -c 500 || echo ''",
+                returnStdout: true
+            ).trim()
+            echo "[DevSentinel] response: ${resp}"
+        }
     } catch (e) {
-        echo "[DevSentinel] POST ${url} failed: ${e.message}"
+        echo "[DevSentinel] POST ${url} exception: ${e.message}"
+    } finally {
+        sh(script: "rm -f ${payloadFile} ${respFile} || true", returnStdout: false)
     }
 }
 
