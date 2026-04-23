@@ -1,205 +1,77 @@
-#!/usr/bin/env groovy
+// vars/devsentinel.groovy
 
-import com.devsentinel.Config
-import com.devsentinel.HttpClient
+def buildStart(Map params) {
+    def payload = [
+        build_id    : params.buildId,
+        job_name    : params.jobName,
+        build_number: params.buildNumber,
+        build_url   : params.buildUrl,
+        branch      : params.branch ?: 'main',
+        obj1_prob   : params.obj1Prob ?: 0.5,
+        // meta features v7 pour phased
+        meta__branch_type   : params.branchType ?: 'main',
+        meta__trigger_type  : params.triggerType ?: 'manual',
+        meta__build_hour    : new Date().getHours(),
+        meta__is_weekend    : (new Date().getDay() in [0,6]) ? 1 : 0,
+    ]
+    _post(env.PHASED_URL + '/webhook/build-start', payload)
+    _post(env.BERT_URL   + '/webhook/build-start', payload)
+    _post(env.OBJ2_URL   + '/webhook/build-start', payload)
+}
 
-/**
- * devsentinel.groovy — DevSentinel AI : Shared Library API (Universal)
- * ======================================================================
- * Compatible avec :
- *   - Declarative Pipeline  (pipeline { stages { ... } })
- *   - Scripted Pipeline     (node { stage(...) { ... } })
- *   - Multibranch Pipeline  (branche auto-détectée)
- *   - Tout type de projet   (Maven, Gradle, Node, Python, Docker...)
- */
+def sendChunk(Map params) {
+    def payload = [
+        build_id    : params.buildId,
+        job_name    : params.jobName,
+        chunk_index : params.chunkIndex,
+        chunk_lines : params.lines,     // list of strings
+        total_lines : params.totalLines,
+    ]
+    // phased → envoie aussi à obj2 en interne via /internal/phased-score
+    _post(env.PHASED_URL + '/webhook/log-chunk', payload)
+    // obj2 → appelle bert en interne via _call_bert()
+    _post(env.OBJ2_URL   + '/webhook/log-chunk', payload)
+}
 
-@groovy.transform.Field
-def _buildId = ""
-
-@groovy.transform.Field
-def _jobName = ""
-
-@groovy.transform.Field
-def _branch = ""
-
-@groovy.transform.Field
-def _chunkIndex = 0
-
-@groovy.transform.Field
-def _client = null
-
-@groovy.transform.Field
-def _stageTimings = [:]
-
-def _getClient() {
-    if (_client == null) {
-        _client = new HttpClient(this)
+def checkAbort(String buildId) {
+    def resp = _get(env.OBJ2_URL + "/score/${buildId}")
+    if (resp?.should_abort == true) {
+        error("🛑 DevSentinel ABORT: score=${resp.risk_score} action=${resp.action}")
     }
-    return _client
+    return resp
 }
 
-def _resolveBranch() {
-    def b = env.BRANCH_NAME
-           ?: env.GIT_BRANCH
-           ?: env.GIT_LOCAL_BRANCH
-           ?: env.CHANGE_BRANCH
-           ?: "unknown"
-    return b.replaceAll(/^origin\//, "")
+def buildEnd(Map params) {
+    def payload = [
+        build_id   : params.buildId,
+        job_name   : params.jobName,
+        status     : params.status,       // SUCCESS / FAILURE / UNSTABLE / ABORTED
+        true_status: params.status,
+        build_url  : params.buildUrl,
+        duration_ms: params.durationMs,
+    ]
+    _post(env.PHASED_URL + '/webhook/build-end', payload)
+    _post(env.BERT_URL   + '/webhook/build-end', payload)
+    _post(env.OBJ2_URL   + '/webhook/build-end', payload)
 }
 
-def _initBuildContext() {
-    _jobName      = env.JOB_NAME ?: "unknown"
-    _branch       = _resolveBranch()
-    _buildId      = "${_jobName}/${_branch}_${env.BUILD_NUMBER ?: '0'}"
-    _chunkIndex   = 0
-    _stageTimings = [:]
-}
-
-def _detectBranchType(String branch) {
-    def b = branch.toLowerCase()
-    if (b.startsWith("pr-") || b.startsWith("pull-")) return "pr"
-    if (b =~ /^\d+$/)                                  return "pr"
-    if (b in ["main", "master"])                       return "main"
-    if (b.startsWith("release"))                       return "release"
-    if (b.startsWith("hotfix"))                        return "hotfix"
-    if (b.startsWith("develop") || b == "dev")         return "develop"
-    if (b.startsWith("feature") || b.startsWith("feat")) return "feature"
-    if (b.startsWith("bugfix")  || b.startsWith("fix"))  return "bugfix"
-    return "other"
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// BUILD START
-// ═══════════════════════════════════════════════════════════════════════════
-
-def buildStart(Map opts = [:]) {
-    if (!Config.isEnabled(env)) {
-        echo "[DevSentinel] Disabled — skipping"
-        return
-    }
-
-    _initBuildContext()
-    def client = _getClient()
-
-    echo "[DevSentinel] ▶ Build start: ${_buildId} | branch=${_branch} | type=${_detectBranchType(_branch)}"
-
-    client.post("${Config.obj2Url(env)}/webhook/build-start", [
-        build_id:    _buildId,
-        branch:      _branch,
-        branch_type: _detectBranchType(_branch),
-        job_name:    _jobName,
-        build_url:   env.BUILD_URL ?: "",
-        prev_status: currentBuild.previousBuild?.result ?: "none",
-    ])
-
-    client.post("${Config.bertUrl(env)}/webhook/build-start", [
-        build_id:     _buildId,
-        job_name:     _jobName,
-        build_number: env.BUILD_NUMBER ?: "0",
-        build_url:    env.BUILD_URL ?: "",
-        branch:       _branch,
-    ])
-
-    echo "[DevSentinel] ✅ All models initialized"
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// WRAP STAGE — sandbox-safe, sans rawBuild
-// ═══════════════════════════════════════════════════════════════════════════
-
-def wrapStage(String stageName, Closure body) {
-    if (!Config.isEnabled(env)) {
-        body()
-        return
-    }
-
-    def startTime   = System.currentTimeMillis()
-    def stageStatus = "SUCCESS"
-    def capturedLogs = []
-
+// ─── helpers privés ─────────────────────────────────────────────────
+private def _post(String url, Map body) {
     try {
-        body()
-    } catch (Exception e) {
-        stageStatus = "FAILURE"
-        capturedLogs << "ERROR: ${e.message}"
-        throw e
-    } finally {
-        def duration = System.currentTimeMillis() - startTime
-        _stageTimings[stageName] = duration
-        try {
-            _sendStageChunk(stageName, stageStatus, duration, capturedLogs)
-        } catch (Exception ex) {
-            echo "[DevSentinel] wrapStage warning: ${ex.message}"
-        }
+        def json = groovy.json.JsonOutput.toJson(body)
+        sh(script: """curl -sS -m 5 -X POST -H 'Content-Type: application/json' \
+                      -d '${json.replace("'", "'\\''")}' ${url} || true""",
+           returnStdout: false)
+    } catch (e) {
+        echo "[DevSentinel] POST ${url} failed: ${e.message}"
     }
 }
 
-def _sendStageChunk(String stageName, String stageStatus, long duration, List extraLogs) {
-    def client = _getClient()
-    _chunkIndex++
-
-    client.post("${Config.obj2Url(env)}/webhook/log-chunk", [
-        build_id:     _buildId,
-        job_name:     _jobName,
-        stage_name:   stageName,
-        stage_status: stageStatus,
-        duration_ms:  duration,
-        chunk_index:  _chunkIndex,
-        chunk_text:   extraLogs.join('\n'),
-        chunk_lines:  extraLogs,
-        total_lines:  extraLogs.size(),
-    ])
-
-    client.post("${Config.bertUrl(env)}/webhook/log-chunk", [
-        build_id:  _buildId,
-        job_name:  _jobName,
-        log_chunk: extraLogs.join('\n'),
-        stage:     stageName,
-    ])
-
-    if (_chunkIndex % 5 == 0) {
-        def score = client.get("${Config.obj2Url(env)}/score/${_buildId}")
-        if (score?.should_abort) {
-            echo "[DevSentinel] ⚠️ ABORT signal — risk=${score.risk_score} action=${score.action}"
-        }
+private def _get(String url) {
+    try {
+        def out = sh(script: "curl -sS -m 3 ${url} || echo '{}'", returnStdout: true).trim()
+        return readJSON(text: out)
+    } catch (e) {
+        return [:]
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// BUILD END
-// ═══════════════════════════════════════════════════════════════════════════
-
-def buildEnd(Map opts = [:]) {
-    if (!Config.isEnabled(env)) return
-
-    def client = _getClient()
-    def status = currentBuild.result ?: currentBuild.currentResult ?: "SUCCESS"
-
-    echo "[DevSentinel] ◼ Build end: ${_buildId} | status=${status}"
-
-    client.post("${Config.obj2Url(env)}/webhook/build-end", [
-        build_id:      _buildId,
-        job_name:      _jobName,
-        branch:        _branch,
-        status:        status,
-        duration_ms:   currentBuild.duration ?: 0,
-        stage_timings: _stageTimings,
-    ])
-
-    client.post("${Config.bertUrl(env)}/webhook/build-end", [
-        build_id:    _buildId,
-        true_status: status,
-        branch:      _branch,
-    ])
-
-    echo "[DevSentinel] ✅ Build end processed"
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// SEND LOG — envoi manuel optionnel
-// ═══════════════════════════════════════════════════════════════════════════
-
-def sendLog(String logText) {
-    if (!Config.isEnabled(env)) return
-    _sendStageChunk("manual", "RUNNING", 0, logText.split('\n') as List)
 }
