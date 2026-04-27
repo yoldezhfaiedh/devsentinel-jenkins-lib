@@ -1,4 +1,23 @@
 // vars/devsentinel.groovy
+// =====================================================================
+// DevSentinel Shared Library — propagation contexte SCM pour rollback
+// =====================================================================
+//
+// API exposée :
+//   buildStart(buildId, jobName, buildNumber, buildUrl, branch, ...)
+//   updateContext(buildId, repoUrl, commitSha, stableCommitSha, branch)  ← NEW
+//   sendChunk(buildId, jobName, chunkIndex, lines, totalLines)
+//   checkAbort(buildId)
+//   buildEnd(buildId, jobName, status, buildUrl, durationMs,
+//            branch, repoUrl, commitSha, stableCommitSha, buildNumber)
+//
+// Wiring DevSentinel :
+//   - PHASED_URL  = http://192.168.1.112:5000
+//   - BERT_URL    = http://192.168.1.112:5002
+//   - OBJ2_URL    = http://192.168.1.112:5004 (seul à recevoir log-chunk)
+//
+// Note CodeBERT/phased ont leur propre poller Jenkins → on ne leur push
+// PAS les chunks pour éviter le double comptage.
 
 def buildStart(Map params) {
     def payload = [
@@ -16,6 +35,23 @@ def buildStart(Map params) {
     _post(env.PHASED_URL + '/webhook/build-start', payload)
     _post(env.BERT_URL   + '/webhook/build-start', payload)
     _post(env.OBJ2_URL   + '/webhook/build-start', payload)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// NEW : updateContext — appelé après le clone Git pour propager les
+// SHAs à Obj2, qui les inclura dans CHAQUE payload Kafka predictions.
+// Cela permet au flux ABORT/WARN n8n de connaître le commit_sha
+// pendant le build, sans attendre le build-end.
+// ─────────────────────────────────────────────────────────────────────
+def updateContext(Map params) {
+    def payload = [
+        build_id          : params.buildId,
+        repo_url          : params.repoUrl ?: '',
+        commit_sha        : params.commitSha ?: '',
+        stable_commit_sha : params.stableCommitSha ?: '',
+        branch            : params.branch ?: '',
+    ]
+    _post(env.OBJ2_URL + '/webhook/build-context', payload)
 }
 
 def sendChunk(Map params) {
@@ -60,7 +96,10 @@ def buildEnd(Map params) {
     _post(env.OBJ2_URL   + '/webhook/build-end', payload, 30)
 }
 
-// ─── helpers privés ─────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+// helpers privés
+// ═══════════════════════════════════════════════════════════════════════
+
 private def _post(String url, Map body, int timeout = 10) {
     def json = groovy.json.JsonOutput.toJson(body)
     def ts   = System.currentTimeMillis()
