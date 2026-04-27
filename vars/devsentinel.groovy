@@ -8,7 +8,6 @@ def buildStart(Map params) {
         build_url   : params.buildUrl,
         branch      : params.branch ?: 'main',
         obj1_prob   : params.obj1Prob ?: 0.5,
-        // meta features v7 pour phased
         meta__branch_type   : params.branchType ?: 'main',
         meta__trigger_type  : params.triggerType ?: 'manual',
         meta__build_hour    : new Date().getHours(),
@@ -24,13 +23,13 @@ def sendChunk(Map params) {
         build_id    : params.buildId,
         job_name    : params.jobName,
         chunk_index : params.chunkIndex,
-        chunk_lines : params.lines,     // list of strings
+        chunk_lines : params.lines,
         total_lines : params.totalLines,
     ]
-    // phased → envoie aussi à obj2 en interne via /internal/phased-score
-    _post(env.PHASED_URL + '/webhook/log-chunk', payload)
-    // obj2 → appelle bert en interne via _call_bert()
-    _post(env.OBJ2_URL   + '/webhook/log-chunk', payload)
+    // Phased et BERT ont leurs propres pollers Jenkins (progressiveText)
+    // → ne pas leur pousser de chunks pour éviter le double comptage.
+    // Obj2 n'a pas de poller → c'est le seul qui a besoin du webhook.
+    _post(env.OBJ2_URL + '/webhook/log-chunk', payload)
 }
 
 def checkAbort(String buildId) {
@@ -45,7 +44,7 @@ def buildEnd(Map params) {
     def payload = [
         build_id   : params.buildId,
         job_name   : params.jobName,
-        status     : params.status,       // SUCCESS / FAILURE / UNSTABLE / ABORTED
+        status     : params.status,
         true_status: params.status,
         build_url  : params.buildUrl,
         duration_ms: params.durationMs,
@@ -56,9 +55,6 @@ def buildEnd(Map params) {
 }
 
 // ─── helpers privés ─────────────────────────────────────────────────
-// v2 : --data-binary @file (plus d'échappement shell fragile)
-//      + http_code visible dans la console Jenkins
-//      + response body affichée si erreur
 private def _post(String url, Map body) {
     def json = groovy.json.JsonOutput.toJson(body)
     def ts   = System.currentTimeMillis()
