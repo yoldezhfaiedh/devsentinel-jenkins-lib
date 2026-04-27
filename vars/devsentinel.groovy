@@ -1,142 +1,39 @@
-// vars/devsentinel.groovy
-// =====================================================================
-// DevSentinel Shared Library — propagation contexte SCM pour rollback
-// =====================================================================
-//
-// API exposée :
-//   buildStart(buildId, jobName, buildNumber, buildUrl, branch, ...)
-//   updateContext(buildId, repoUrl, commitSha, stableCommitSha, branch)  ← NEW
-//   sendChunk(buildId, jobName, chunkIndex, lines, totalLines)
-//   checkAbort(buildId)
-//   buildEnd(buildId, jobName, status, buildUrl, durationMs,
-//            branch, repoUrl, commitSha, stableCommitSha, buildNumber)
-//
-// Wiring DevSentinel :
-//   - PHASED_URL  = http://192.168.1.112:5000
-//   - BERT_URL    = http://192.168.1.112:5002
-//   - OBJ2_URL    = http://192.168.1.112:5004 (seul à recevoir log-chunk)
-//
-// Note CodeBERT/phased ont leur propre poller Jenkins → on ne leur push
-// PAS les chunks pour éviter le double comptage.
-
-def buildStart(Map params) {
-    def payload = [
-        build_id    : params.buildId,
-        job_name    : params.jobName,
-        build_number: params.buildNumber,
-        build_url   : params.buildUrl,
-        branch      : params.branch ?: 'main',
-        obj1_prob   : params.obj1Prob ?: 0.5,
-        meta__branch_type   : params.branchType ?: 'main',
-        meta__trigger_type  : params.triggerType ?: 'manual',
-        meta__build_hour    : new Date().getHours(),
-        meta__is_weekend    : (new Date().getDay() in [0,6]) ? 1 : 0,
-    ]
-    _post(env.PHASED_URL + '/webhook/build-start', payload)
-    _post(env.BERT_URL   + '/webhook/build-start', payload)
-    _post(env.OBJ2_URL   + '/webhook/build-start', payload)
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// NEW : updateContext — appelé après le clone Git pour propager les
-// SHAs à Obj2, qui les inclura dans CHAQUE payload Kafka predictions.
-// Cela permet au flux ABORT/WARN n8n de connaître le commit_sha
-// pendant le build, sans attendre le build-end.
-// ─────────────────────────────────────────────────────────────────────
-def updateContext(Map params) {
-    def payload = [
-        build_id          : params.buildId,
-        repo_url          : params.repoUrl ?: '',
-        commit_sha        : params.commitSha ?: '',
-        stable_commit_sha : params.stableCommitSha ?: '',
-        branch            : params.branch ?: '',
-    ]
-    _post(env.OBJ2_URL + '/webhook/build-context', payload)
-}
-
-def sendChunk(Map params) {
-    def payload = [
-        build_id    : params.buildId,
-        job_name    : params.jobName,
-        chunk_index : params.chunkIndex,
-        chunk_lines : params.lines,
-        total_lines : params.totalLines,
-    ]
-    // Phased et BERT ont leurs propres pollers Jenkins (progressiveText)
-    // → ne pas leur pousser de chunks pour éviter le double comptage.
-    // Obj2 n'a pas de poller → c'est le seul qui a besoin du webhook.
-    _post(env.OBJ2_URL + '/webhook/log-chunk', payload)
-}
-
-def checkAbort(String buildId) {
-    def resp = _get(env.OBJ2_URL + "/score/${buildId}")
-    if (resp?.should_abort == true) {
-        error("🛑 DevSentinel ABORT: score=${resp.risk_score} action=${resp.action}")
-    }
-    return resp
-}
-
-def buildEnd(Map params) {
-    def payload = [
-        build_id            : params.buildId,
-        job_name            : params.jobName,
-        status              : params.status,
-        true_status         : params.status,
-        build_url           : params.buildUrl,
-        duration_ms         : params.durationMs,
-        // ── Contexte Git pour rollback_queue ──
-        branch              : params.branch ?: '',
-        repo_url            : params.repoUrl ?: '',
-        commit_sha          : params.commitSha ?: '',
-        stable_commit_sha   : params.stableCommitSha ?: '',
-        build_number        : params.buildNumber ?: '',
-    ]
-    _post(env.PHASED_URL + '/webhook/build-end', payload, 30)
-    _post(env.BERT_URL   + '/webhook/build-end', payload, 30)
-    _post(env.OBJ2_URL   + '/webhook/build-end', payload, 30)
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// helpers privés
-// ═══════════════════════════════════════════════════════════════════════
-
-private def _post(String url, Map body, int timeout = 10) {
-    def json = groovy.json.JsonOutput.toJson(body)
-    def ts   = System.currentTimeMillis()
-    def payloadFile = "ds_payload_${ts}.json"
-    def respFile    = "ds_resp_${ts}.txt"
-    try {
-        writeFile file: payloadFile, text: json
-        def rc = sh(
-            script: """curl -sS -m ${timeout} \
-                       -o ${respFile} \
-                       -w '%{http_code}' \
-                       -X POST \
-                       -H 'Content-Type: application/json' \
-                       --data-binary @${payloadFile} \
-                       ${url}""",
-            returnStdout: true
-        ).trim()
-        echo "[DevSentinel] POST ${url} → HTTP ${rc}"
-        if (!rc.startsWith('2')) {
-            def resp = sh(
-                script: "cat ${respFile} 2>/dev/null | head -c 500 || echo ''",
-                returnStdout: true
-            ).trim()
-            echo "[DevSentinel] response: ${resp}"
+// devsentinel-lib/vars/notifyEnd.groovy (ou équivalent)
+def call(Map config = [:]) {
+    // Récupère les vars Git de manière robuste
+    def gitUrl = env.GIT_URL ?: ''
+    def gitCommit = env.GIT_COMMIT ?: ''
+    def gitBranch = (env.GIT_BRANCH ?: env.BRANCH_NAME ?: 'main').replaceAll('^origin/', '')
+    
+    // Fallback : git CLI direct si env vars vides
+    if (!gitCommit) {
+        try {
+            gitCommit = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+        } catch (e) {
+            echo "[devsentinel] WARN cannot resolve commit_sha: ${e.message}"
         }
-    } catch (e) {
-        echo "[DevSentinel] POST ${url} exception: ${e.message}"
-    } finally {
-        sh(script: "rm -f ${payloadFile} ${respFile} || true", returnStdout: false)
     }
-}
-
-private def _get(String url) {
-    try {
-        def out = sh(script: "curl -sS -m 3 ${url} || echo '{}'", returnStdout: true).trim()
-        return readJSON(text: out)
-    } catch (e) {
-        return [:]
+    if (!gitUrl) {
+        try {
+            gitUrl = sh(returnStdout: true, script: 'git config --get remote.origin.url').trim()
+        } catch (e) {
+            echo "[devsentinel] WARN cannot resolve repo_url: ${e.message}"
+        }
     }
+    
+    def payload = [
+        build_id        : "${env.JOB_NAME}_${env.BUILD_NUMBER}",
+        branch          : gitBranch,
+        repo_url        : gitUrl,           // ← AJOUT
+        commit_sha      : gitCommit,        // ← AJOUT
+        downstream_job  : env.JOB_NAME,     // ← AJOUT
+        // ... autres champs (score, anomalies, etc.)
+    ]
+    
+    httpRequest(
+        url: "${env.DEVSENTINEL_PHASED_URL}/webhook-predictions",
+        httpMode: 'POST',
+        contentType: 'APPLICATION_JSON',
+        requestBody: groovy.json.JsonOutput.toJson(payload)
+    )
 }
