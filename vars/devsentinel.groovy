@@ -42,20 +42,26 @@ def checkAbort(String buildId) {
 
 def buildEnd(Map params) {
     def payload = [
-        build_id   : params.buildId,
-        job_name   : params.jobName,
-        status     : params.status,
-        true_status: params.status,
-        build_url  : params.buildUrl,
-        duration_ms: params.durationMs,
+        build_id            : params.buildId,
+        job_name            : params.jobName,
+        status              : params.status,
+        true_status         : params.status,
+        build_url           : params.buildUrl,
+        duration_ms         : params.durationMs,
+        // ── Contexte Git pour rollback_queue ──
+        branch              : params.branch ?: '',
+        repo_url            : params.repoUrl ?: '',
+        commit_sha          : params.commitSha ?: '',
+        stable_commit_sha   : params.stableCommitSha ?: '',
+        build_number        : params.buildNumber ?: '',
     ]
-    _post(env.PHASED_URL + '/webhook/build-end', payload)
-    _post(env.BERT_URL   + '/webhook/build-end', payload)
-    _post(env.OBJ2_URL   + '/webhook/build-end', payload)
+    _post(env.PHASED_URL + '/webhook/build-end', payload, 30)
+    _post(env.BERT_URL   + '/webhook/build-end', payload, 30)
+    _post(env.OBJ2_URL   + '/webhook/build-end', payload, 30)
 }
 
 // ─── helpers privés ─────────────────────────────────────────────────
-private def _post(String url, Map body) {
+private def _post(String url, Map body, int timeout = 10) {
     def json = groovy.json.JsonOutput.toJson(body)
     def ts   = System.currentTimeMillis()
     def payloadFile = "ds_payload_${ts}.json"
@@ -63,7 +69,7 @@ private def _post(String url, Map body) {
     try {
         writeFile file: payloadFile, text: json
         def rc = sh(
-            script: """curl -sS -m 10 \
+            script: """curl -sS -m ${timeout} \
                        -o ${respFile} \
                        -w '%{http_code}' \
                        -X POST \
